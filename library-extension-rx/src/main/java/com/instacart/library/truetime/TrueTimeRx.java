@@ -13,13 +13,17 @@ import io.reactivex.functions.Function;
 import io.reactivex.functions.Predicate;
 import io.reactivex.schedulers.Schedulers;
 import java.io.IOException;
+import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
+import java.util.concurrent.Callable;
+
 import org.reactivestreams.Publisher;
 
 public class TrueTimeRx
@@ -29,6 +33,8 @@ public class TrueTimeRx
     private static final String TAG = TrueTimeRx.class.getSimpleName();
 
     private int _retryCount = 50;
+
+    private Predicate<InetAddress> _addressFilter = null;
 
     public static TrueTimeRx build() {
         return RX_INSTANCE;
@@ -78,6 +84,21 @@ public class TrueTimeRx
         return this;
     }
 
+    public TrueTimeRx withoutIpV6() {
+        _addressFilter = new Predicate<InetAddress>() {
+            @Override
+            public boolean test(InetAddress inetAddress) {
+                return inetAddress instanceof Inet4Address;
+            }
+        };
+        return this;
+    }
+
+    public TrueTimeRx withCustomIpAddressFilter(Predicate<InetAddress> predicate) {
+        _addressFilter = predicate;
+        return this;
+    }
+
     /**
      * Initialize TrueTime
      * See {@link #initializeNtp(String)} for details on working
@@ -86,13 +107,18 @@ public class TrueTimeRx
      */
     public Single<Date> initializeRx(String ntpPoolAddress) {
         return isInitialized()
-                ? Single.just(now())
+                ? Single.fromCallable(new Callable<Date>() {
+            @Override
+            public Date call() throws Exception {
+                return now();
+            }
+        })
                 : initializeNtp(ntpPoolAddress).map(new Function<long[], Date>() {
-                    @Override
-                    public Date apply(long[] longs) throws Exception {
-                        return now();
-                    }
-                });
+            @Override
+            public Date apply(long[] longs) throws Exception {
+                return now();
+            }
+        });
      }
 
     /**
@@ -180,7 +206,23 @@ public class TrueTimeRx
                           public Flowable<InetAddress> apply(String ntpPoolAddress) {
                               try {
                                   TrueLog.d(TAG, "---- resolving ntpHost : " + ntpPoolAddress);
-                                  return Flowable.fromArray(InetAddress.getAllByName(ntpPoolAddress));
+                                  InetAddress[] addresses = InetAddress.getAllByName(ntpPoolAddress);
+                                  Predicate<InetAddress> filter = _addressFilter;
+                                  if (filter == null) {
+                                      return Flowable.fromArray(addresses);
+                                  } else {
+                                      ArrayList<InetAddress> validAddresses = new ArrayList<>();
+                                      for (InetAddress i : addresses) {
+                                          try {
+                                              if (filter.test(i)) {
+                                                  validAddresses.add(i);
+                                              }
+                                          } catch (Exception e) {
+                                              return Flowable.error(e);
+                                          }
+                                      }
+                                      return Flowable.fromIterable(validAddresses);
+                                  }
                               } catch (UnknownHostException e) {
                                   return Flowable.error(e);
                               }
@@ -211,7 +253,9 @@ public class TrueTimeRx
                                               o.onNext(requestTime(singleIpHostAddress));
                                               o.onComplete();
                                           } catch (IOException e) {
-                                              o.tryOnError(e);
+                                              if (!o.isCancelled()) {
+                                                  o.onError(e);
+                                              }
                                           }
                                       }
                                   }, BackpressureStrategy.BUFFER)
